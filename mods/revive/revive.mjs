@@ -210,8 +210,10 @@ const hintOf = (args) => {
 };
 
 async function hook(args = []) {
+  const isAgy = hintOf(args) === "agy";
+  const reply = () => { if (isAgy) process.stdout.write("{}\n"); };
   // REVIVE_DEBUG=1 in the agent's environment: why a hook recorded nothing, on stderr.
-  const skip = (why) => { if (process.env.REVIVE_DEBUG) process.stderr.write(`revive hook: ${why}\n`); };
+  const skip = (why) => { if (process.env.REVIVE_DEBUG) process.stderr.write(`revive hook: ${why}\n`); reply(); };
   const payload = hookPayload(await readStdin());
   let t = process.env.HC_TERMINAL_ID;
   const { event, session } = payload;
@@ -275,8 +277,8 @@ async function hook(args = []) {
       flags: JSON.stringify(flags),
       env: null,
       needs: needs.length ? JSON.stringify(needs) : null,
-      // pi and omp keep sessions where their flags, environment or settings say: the file named is the one to check.
-      transcript: EXTENSION_AGENTS.includes(key) && payload.transcript && isAbsolute(String(payload.transcript)) ? payload.transcript : null,
+      // pi, omp and agy keep sessions where their flags, environment or settings say: the file named is the one to check.
+      transcript: (EXTENSION_AGENTS.includes(key) || key === "agy") && payload.transcript && isAbsolute(String(payload.transcript)) ? payload.transcript : null,
       shell: terminal.pid ?? "",
       since: table.get(terminal.pid)?.since ?? null,
       at: same ? rec.at ?? Date.now() : Date.now(),
@@ -286,11 +288,12 @@ async function hook(args = []) {
       // "resumed" mark; a new one starts without.
       resumed: same ? rec.resumed : null,
     }));
+    reply();
     return;
   }
 
   if (event === "SessionEnd") {
-    if (!rec || rec.session !== session) return;
+    if (!rec || rec.session !== session) { reply(); return; }
     // Claude Code's reasons (Codex, Droid and pi's extension share them):
     // `/clear` (and `/resume` from inside) ends one session to start another in
     // the same process; that one's SessionStart records it, and clearing here
@@ -302,6 +305,7 @@ async function hook(args = []) {
     if (action === "forget") await label(t, clearArgs());
     else if (action === "settle") await settleLater(t, terminal.pid, session, target);
   }
+  reply();
 }
 
 /**
@@ -465,7 +469,7 @@ const copilotDir = () => agentDirs({ ...process.env, HOME: homedir(), USERPROFIL
  * is all there is to check.
  */
 export function hasTranscript(rec) {
-  if (EXTENSION_AGENTS.includes(rec.agent)) return !rec.transcript || existsSync(rec.transcript);
+  if (EXTENSION_AGENTS.includes(rec.agent) || rec.agent === "agy") return !rec.transcript || existsSync(rec.transcript);
   if (rec.agent === "copilot") return existsSync(join(copilotDir(), "session-state", rec.session));
   if (rec.agent !== "claude") return true;
   const projects = join(claudeDir(), "projects");
@@ -537,7 +541,7 @@ function claudeSessionFor(pid) {
  * and the fork is let through.
  */
 function forkable(rec, fgPid) {
-  if (EXTENSION_AGENTS.includes(rec.agent)) return hasTranscript(rec);
+  if (EXTENSION_AGENTS.includes(rec.agent) || rec.agent === "agy") return hasTranscript(rec);
   if (rec.agent !== "claude") return true;
   const known = fgPid && claudeSessionFor(fgPid) !== null;
   if (!known) return null;
@@ -846,6 +850,9 @@ const extensionPath = (key) => join(EXTENSIONS[key].dir(), "extensions", "herdr-
 const isExtension = (key, path) => readText(path).includes(EXTENSIONS[key].marker);
 const factoryDir = () => agentDirs({ ...process.env, HOME: homedir(), USERPROFILE: homedir() }).factory;
 const cursorDir = () => agentDirs({ ...process.env, HOME: homedir(), USERPROFILE: homedir() }).cursor;
+const agyGeminiDir = () => join(homedir(), ".gemini");
+const agyConfigDir = () => join(agyGeminiDir(), "config");
+const agyHooks = () => join(agyConfigDir(), "hooks.json");
 const copilotHooks = () => join(copilotDir(), "hooks", "herdr-revive.json");
 
 /**
@@ -1089,12 +1096,17 @@ export function shellBlock(engine = ENGINE) {
     // prompt, for one, holds on to it while they run).
     `    if [ -z "$__revive" ]; then unset __revive`,
     `    elif [ -n "$ZSH_VERSION" ]; then`,
-    `      __revive_run() { add-zsh-hook -d precmd __revive_run; eval "$__revive"; unset __revive; unfunction __revive_run; }`,
+    `      __revive_run() { add-zsh-hook -d precmd __revive_run; case "$__revive" in *" agy "*|*"/agy "*) __revive_agy=1 ;; esac; eval "$__revive"; unset __revive; unfunction __revive_run; }`,
     `      autoload -Uz add-zsh-hook && add-zsh-hook precmd __revive_run`,
     `    elif [ -n "$BASH_VERSION" ]; then`,
     `      __revive_run() { PROMPT_COMMAND="\${PROMPT_COMMAND#__revive_run;}"; eval "$__revive"; unset __revive; unset -f __revive_run; }`,
     `      PROMPT_COMMAND="__revive_run;\${PROMPT_COMMAND}"`,
     `    else eval "$__revive"; unset __revive; fi`,
+    `  fi`,
+    `  if [ -n "$ZSH_VERSION" ]; then`,
+    `    __revive_agy_preexec() { case " $1 $2 " in *" agy "*|*"/agy "*|*" antigravity "*|*"/antigravity "*) __revive_agy=1 ;; esac; }`,
+    `    __revive_agy_precmd() { __revive_rc=$?; if [ -n "$__revive_agy" ]; then unset __revive_agy; if [ "$__revive_rc" -eq 0 ]; then node ${q} clear --agent agy >/dev/null 2>&1; fi; fi; unset __revive_rc; }`,
+    `    autoload -Uz add-zsh-hook && add-zsh-hook preexec __revive_agy_preexec && add-zsh-hook precmd __revive_agy_precmd`,
     `  fi`,
     `  unset __revive_j __revive_has`,
     // Shells started from this one know it ran here (see ownShell).
@@ -1242,6 +1254,29 @@ export function withCopilotHooks(doc, { remove = false, win = IS_WIN } = {}) {
 }
 export const hasCopilotHooks = (doc) => EVENTS.every((e) => (doc?.hooks?.[e] ?? []).some(isOursCopilot));
 
+const AGY_HOOK_NAME = "herdr-revive";
+/**
+ * Antigravity CLI's `~/.gemini/config/hooks.json`: named top-level entries,
+ * with `SessionStart` as a flat array of command hooks. It has no `SessionEnd`.
+ */
+export function withAgyHooks(doc, { remove = false } = {}) {
+  const out = structuredClone(doc ?? {});
+  const command = hookCommand("agy", true);
+  const existing = out[AGY_HOOK_NAME];
+  const list = Array.isArray(existing?.SessionStart) ? existing.SessionStart : [];
+  const ours = list.filter(isOurs);
+  if (!remove && ours.length === 1 && ours[0].command === command && ours[0].timeout === 10 && list.length === 1) return out;
+  if (remove) {
+    delete out[AGY_HOOK_NAME];
+    return out;
+  }
+  const kept = list.filter((h) => !isOurs(h));
+  kept.push({ type: "command", command, timeout: 10 });
+  out[AGY_HOOK_NAME] = { ...(existing && typeof existing === "object" ? existing : {}), SessionStart: kept };
+  return out;
+}
+export const hasAgyHooks = (doc) => Array.isArray(doc?.[AGY_HOOK_NAME]?.SessionStart) && doc[AGY_HOOK_NAME].SessionStart.some(isOurs);
+
 /** `kind`: the shell whose file it is; PowerShell's get pwshBlock, zsh's and bash's shellBlock. */
 export function withShellBlock(text, { remove = false, kind = null } = {}) {
   if (remove && !text.includes(BEGIN)) return text;
@@ -1380,6 +1415,14 @@ const HOOK_TARGETS = {
     files: () => [copilotHooks()],
     edit: (d, o) => withCopilotHooks(d, o),
     has: hasCopilotHooks,
+  },
+  agy: {
+    dir: agyConfigDir,
+    present: () => existsSync(agyGeminiDir()) && hasCli("agy", ["/opt/homebrew/bin", "/usr/local/bin"]),
+    flag: "--no-agy",
+    files: () => [agyHooks()],
+    edit: (d, o) => withAgyHooks(d, o),
+    has: hasAgyHooks,
   },
 };
 const targetOf = (h) => (h.target ?? ((files) => files[0]))(h.files());
@@ -1559,9 +1602,21 @@ export function doctorReport() {
 
 // ── main ────────────────────────────────────────────────────────────────────
 
+async function clear(args) {
+  const t = process.env.HC_TERMINAL_ID;
+  if (!t || !(await coreUp())) return;
+  const onlyAgent = hintOf(args);
+  const terminal = await getTerminal(t).catch(() => null);
+  if (!terminal) return;
+  const rec = readRecord(terminal.labels);
+  if (!rec || rec.failed || (onlyAgent && rec.agent !== onlyAgent)) return;
+  await label(t, clearArgs());
+}
+
 const COMMANDS = {
   hook: { run: (a) => hook(a), quiet: true },
   settle: { run: (a) => settle(a), quiet: true },
+  clear: { run: (a) => clear(a), quiet: true },
   check: { run: check, quiet: true },
   failed: { run: failed, quiet: true },
   list: { run: list },

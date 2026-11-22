@@ -440,7 +440,60 @@ export const AGENTS = {
     // never: tools run without asking. Anything other than Muse's asking modes is left out.
     unattended: { "--approval-mode": unless("untrusted", "on-request") },
   },
+  // Google Antigravity CLI (`agy`), checked against agy 1.5.10: `agy` wraps the
+  // `antigravity` binary, reports itself to Herdr as `antigravity`, and installs
+  // its SessionStart hook in `~/.gemini/config/hooks.json` (camelCase payload,
+  // expects `{}` on stdout). `--conversation <id>` resumes the same session;
+  // it has no native `--fork` flag, so fork launches a fresh interactive `agy`
+  // session seeded with the parent conversation's transcript path via `-i`.
+  agy: {
+    name: "Antigravity",
+    bin: "agy",
+    bins: ["agy", "antigravity"],
+    apps: ["antigravity"],
+    argv0Only: true,
+    resume: (id, flags) => ["agy", ...flags, "--conversation", id],
+    fork: (id, flags, rec) => {
+      const transcript = rec?.transcript && !/[\r\n\0]/.test(rec.transcript) ? rec.transcript : null;
+      const prompt = transcript
+        ? `Forked from parent Antigravity conversation ${id}. Read ${transcript} for the prior conversation context (if lines have truncated_fields, read the matching line in transcript_full.jsonl beside it). Briefly confirm what you picked up and continue from there.`
+        : `Forked from parent Antigravity conversation ${id}. Briefly ask what to focus on and continue from there.`;
+      return ["agy", ...flags, "-i", prompt];
+    },
+    oneShot: agyOneShot,
+    carry: {
+      "--model": 1,
+      "--effort": 1,
+      "--mode": 1,
+      "--agent": AGENT_NAME,
+      "--dangerously-skip-permissions": 0,
+      "--sandbox": 0,
+    },
+    unattended: {
+      "--dangerously-skip-permissions": true,
+      "--mode": unless("plan"),
+    },
+  },
 };
+
+/** Antigravity CLI subcommands that run once and quit, with no session to resume. */
+const AGY_COMMANDS = new Set(["acp", "agent", "agents", "changelog", "help", "install", "mcp", "mic-serve", "models", "plugin", "plugins", "remote-control", "update"]);
+const AGY_VALUE_FLAGS = new Set([
+  "--add-dir", "--agent", "--conversation", "--effort", "--input-format", "--json-schema",
+  "--log-file", "--mode", "--model", "--output-format", "--print-timeout", "--project",
+  "--prompt-interactive", "-i", "--settings",
+]);
+function agyOneShot(args) {
+  for (let i = 0; i < args.length; i++) {
+    const word = args[i];
+    if (word === "--") return false;
+    if (word === "-p" || word === "--print" || word === "--prompt" || word.startsWith("--prompt=")) return true;
+    if (AGY_VALUE_FLAGS.has(word)) { i++; continue; }
+    if (word.startsWith("-")) continue;
+    return AGY_COMMANDS.has(word);
+  }
+  return false;
+}
 
 /** Muse's subcommands that run once and quit, with no session to resume (`muse resume` is not one). */
 const MUSE_COMMANDS = new Set(["exec", "config", "export", "trace", "model-profile", "skills", "voice", "plugins", "sandbox", "schema", "serve", "mxp", "attach", "acp", "session-message", "sessions", "mcp", "auth", "login", "logout", "usage", "init"]);
@@ -524,14 +577,18 @@ export const endAction = (key, reason) => (AGENTS[key]?.end ?? claudeEnd)(reason
  */
 export function hookPayload(payload) {
   const p = payload && typeof payload === "object" ? payload : {};
-  const name = typeof p.hook_event_name === "string" ? p.hook_event_name : "";
-  const roots = Array.isArray(p.workspace_roots) ? p.workspace_roots : [];
+  const rawName = typeof p.hook_event_name === "string" ? p.hook_event_name
+    : typeof p.hookEventName === "string" ? p.hookEventName : "";
+  const roots = Array.isArray(p.workspace_roots) ? p.workspace_roots
+    : Array.isArray(p.workspacePaths) ? p.workspacePaths : [];
+  const transcript = typeof p.transcript_path === "string" ? p.transcript_path
+    : typeof p.transcriptPath === "string" ? p.transcriptPath : null;
   return {
-    event: name ? name[0].toUpperCase() + name.slice(1) : null,
-    session: p.session_id ?? p.conversation_id ?? null,
+    event: rawName ? rawName[0].toUpperCase() + rawName.slice(1) : null,
+    session: p.session_id ?? p.conversation_id ?? p.conversationId ?? null,
     cwd: p.cwd || roots[0] || null,
     reason: p.reason ?? null,
-    transcript: typeof p.transcript_path === "string" ? p.transcript_path : null,
+    transcript,
     argv: Array.isArray(p.argv) ? p.argv.map(String) : null,
     agent: payloadAgent(p),
   };
@@ -539,13 +596,15 @@ export function hookPayload(payload) {
 
 function payloadAgent(p) {
   // A Windows path (`C:\Users\me\.claude\projects\…`) is read like a POSIX one.
-  const path = String(p.transcript_path ?? "").replace(/\\/g, "/");
+  const path = String(p.transcript_path ?? p.transcriptPath ?? "").replace(/\\/g, "/");
+  if (path.includes("/.gemini/antigravity")) return "agy";
   if (path.includes("/.codex/")) return "codex";
   if (path.includes("/.omp/")) return "omp";
   if (path.includes("/.pi/")) return "pi";
   if (path.includes("/.factory/")) return "droid";
   if (path.includes("/.cursor/") || p.cursor_version !== undefined) return "cursor";
   if (path.includes("/.claude/") || path.includes("/projects/")) return "claude";
+  if (p.artifactDirectoryPath !== undefined || p.hookEventName !== undefined) return "agy";
   return null;
 }
 
@@ -750,7 +809,7 @@ export function command(rec, kind = "resume", { unattended = false } = {}) {
   if (!agent || typeof agent[kind] !== "function" || !validId(rec.session)) return null;
   const flags = safeFlags(rec.agent, rec.flags ?? []);
   // No variables: a resume runs with the shell's own (see `needs`).
-  return agent[kind](rec.session, unattended ? attendedFlags(rec.agent, flags).kept : flags);
+  return agent[kind](rec.session, unattended ? attendedFlags(rec.agent, flags).kept : flags, rec);
 }
 
 /**
